@@ -1,0 +1,406 @@
+---
+title: "MDVC optimization code"
+author: "B. Raynor, A. Saxena"
+date: "12/7/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This code accompanies the manuscript:
+Castillo et al, Optimizing the location of vaccination sites to stop a zoonotic epidemic
+
+## Load and format data  
+
+**Data availability:** Data used for this analysis includes personally identifiable information (the geographic location of homes). For this reason, data files will not be made publically available. For questions or to request access to this data contract corresponding author, Ricardo Castillo (cricardo@upenn.edu).  
+
+Load packages  
+```{r, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tbart)
+library(lme4)
+library(ggmap)
+library(ggsn)
+library(sp)
+library(rgdal)
+```  
+
+Load and format house data
+```{r, warning=FALSE, message=FALSE}
+setwd("~/Rabies")
+
+#Function to convert to utm
+UTMfunction <- function(lat, long) {
+  coord <- data.frame(X=long, Y=lat)
+  df.sp.latlong <- SpatialPoints(coord, proj4string=CRS("+proj=longlat +ellps=WGS84"))
+  df.sp.utm <- spTransform(df.sp.latlong, CRS("+proj=utm +south +zone=19K  +ellps=WGS84"))
+  UTMcoord <- as.data.frame(coordinates(df.sp.utm))
+  return(UTMcoord)
+}
+
+#load in information about vaccinations strategy(whether fixed, mobile, or mixed)
+vac_strat<-read.csv("~/Rabies/VANCAN/Vaccination Strategy.csv") %>%
+  mutate(filter= sub("1.1.", "", Loc_code))%>% #Identify non unique
+  mutate(filter=as.numeric(filter))%>% #unique should all be numberic
+  filter(!is.na(filter))%>% #filter out non numeric
+  select(-X,-X.1,-filter)%>% #remove useless columns
+  mutate(L=c(1:length(Loc_name))) #create ID column
+
+
+#load in house data 2016 - 2018
+all_house_data<-read.csv("~/Rabies/rabia_ASA_encuesta_2018/resultados/houses_merged_2019-02-18_vac.csv") %>%
+  mutate(X = UTMfunction(LATITUDE, LONGITUDE)$X, 
+         Y = UTMfunction(LATITUDE, LONGITUDE)$Y)
+all_house_data<-dplyr::full_join(all_house_data,vac_strat,by='L') #merge vacc strategies
+
+#subset out years
+house_2016_data <- all_house_data %>%
+  filter(year2016==1)%>%
+  select(UNICODE, LATITUDE, LONGITUDE, X, Y, VIVIENDA_VANCAN_2016, Strategy_16)%>%
+  filter(Strategy_16 == "F")%>%
+  select(-Strategy_16)
+
+house_2017_data <- all_house_data %>%
+  filter(year2017==1)%>%
+  select(UNICODE, LATITUDE, LONGITUDE, X, Y, VIVIENDA_VANCAN_2017, Strategy_17)%>%
+  filter(Strategy_17 == "F")%>%
+#  filter(Strategy_17 != "M")%>%
+  select(-Strategy_17)
+
+house_2018_data <- all_house_data %>%
+  filter(year2018==1)%>%
+  select(UNICODE, LATITUDE, LONGITUDE, X, Y, VIVIENDA_VANCAN_2018, Strategy_18)%>%
+  filter(Strategy_18 == "F")%>%
+#  filter(Strategy_18 != "M")%>%
+  select(-Strategy_18)
+
+house_2019_data <- left_join(
+  read.csv('~/Rabies/rabia_ASA_encuesta_2019/resultados/VIVIENDA2019DCE_CLEAN_2019-11-18.csv')%>%
+    rename(UNICODE=VIVIENDA_UNICODE),
+  read.csv('~/Rabies/shortest_way_optimization/demandpoints/demand_points.csv', sep=";")%>%
+    select(UNICODE,lat,long))%>%
+  tidyr::drop_na(lat)%>% ####CHECK THIS 
+  mutate(X = UTMfunction(lat, long)$X, 
+         Y = UTMfunction(lat, long)$Y) %>%
+  rename(LATITUDE = lat,
+         LONGITUDE = long)%>%
+  select(UNICODE, LATITUDE, LONGITUDE, X, Y, VIVIENDA_HAY_PERROS, 
+         VIVIENDA_DONDE_VACUNARON) %>%
+  filter(VIVIENDA_HAY_PERROS==TRUE)%>%
+  mutate(VIVIENDA_VANCAN_2019 = ifelse(is.na(VIVIENDA_DONDE_VACUNARON), 0, 1))%>%
+  select(-VIVIENDA_HAY_PERROS, -VIVIENDA_DONDE_VACUNARON)
+
+```
+
+Load and format vaccination point data
+```{r, warning=FALSE, message=FALSE}
+#General
+vac_points_gen <- read.csv("~/Rabies/VANCAN/VaccinationPoints/PUNTOS_VANCAN_General_CURRENT.csv")
+
+#Each year
+vac_points_2016<-read.csv("~/Rabies/VANCAN/VaccinationPoints/PUNTOS_VANCAN_2016_Indexed_2021.08.26.csv")
+vac_points_2016 <- left_join(vac_points_2016, vac_points_gen) %>%
+  filter(TypeFix == "F")%>%
+  mutate(X = UTMfunction(lat, long)$X,
+         Y = UTMfunction(lat, long)$Y)%>%
+  select(VaccPoint, PointName, yearlabel, lat, long, X, Y, TypeFix)
+
+
+#2017
+vac_points_2017<-read.csv("~/Rabies/VANCAN/VaccinationPoints/PUNTOS_VANCAN_2017_Indexed_2021.08.26.csv")
+vac_points_2017 <- left_join(vac_points_2017, vac_points_gen)%>%
+  filter(TypeFix == "F")%>%
+  mutate(X = UTMfunction(lat, long)$X,
+         Y = UTMfunction(lat, long)$Y)%>%
+  select(VaccPoint, PointName, yearlabel, lat, long, X, Y, TypeFix)
+
+#2018
+vac_points_2018<-read.csv('~/Rabies/rabia_ASA_encuesta_2018/base/Puntos_VANCAN_General.csv',sep=';')%>%
+  select(VaccPoint)%>%
+  mutate(yearlabel=2018)
+vac_points_2018 <- left_join(vac_points_2018, vac_points_gen)%>%
+  filter(TypeFix == "F")%>%
+  mutate(X = UTMfunction(lat, long)$X,
+         Y = UTMfunction(lat, long)$Y)%>%
+  select(VaccPoint, PointName, yearlabel, lat, long, X, Y, TypeFix)
+
+
+#2019
+vac_points_2019<-read.csv("~/Rabies/VANCAN/VaccinationPoints/PUNTOS_VANCAN_2019_Indexed_2021.08.26.csv")
+vac_points_2019 <- left_join(vac_points_2019, vac_points_gen)%>%
+  filter(TypeFix == "F")%>%
+  mutate(X = UTMfunction(lat, long)$X,
+         Y = UTMfunction(lat, long)$Y)%>%
+  select(VaccPoint, PointName, yearlabel, lat, long, X, Y, TypeFix)
+```
+
+Map of study area
+**Fig 1. Alto Selva Alegre district with possible vaccination locations**
+```{r, warning=FALSE, message=FALSE}
+#2016 vancan
+# Set projection
+latlon_CRS <- CRS("+proj=longlat +ellps=WGS84")
+
+#pull district shapefle and format
+limits <- rgdal::readOGR("~/Rabies/Shapefiles AQP/db/InstitutoGeograficoNacional/distritos/DISTRITOS.shp")
+limits_shp.new <- spTransform(limits,latlon_CRS)
+ASA<- limits_shp.new[limits_shp.new$DISTRITO %in% c("ALTO SELVA ALEGRE"),]
+
+#basemap
+basemap <- ggmap(get_stamenmap(maptype='terrain',bbox=c(left=-71.54,right=-71.488,top=-16.332,bottom=-16.392),zoom=14)) 
+
+#add layers
+ASAmap <-basemap +
+  geom_polygon(data =ASA, aes(x = long, y = lat, group = group), 
+                 colour = "black", size=1, fill = "black", alpha=0.3)+
+  geom_point(data=vac_points_gen, aes(x=long,y=lat),fill="white",shape=24,size=3)+
+  theme(legend.text=element_text(size=5))+
+  scalebar(x.min = -71.53, x.max = -71.495,  y.min = -16.39, y.max = -16.34, 
+           dist = 1, dist_unit = "km", st.bottom = FALSE, st.color = "black",
+           st.dist=0.05, transform = TRUE, model = "WGS84")+
+  ggtitle('Alto Selva Alegra District')+
+  theme(legend.position=c(0.85,0.85),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        rect = element_blank(),
+        legend.text=element_text(size=8,face='bold'))
+  north2(ASAmap, scale=0.12, x=.65,y=.25)
+```
+
+Load and format walking distance matrix
+```{r, warning=FALSE, message=FALSE}
+################################################################################
+#Load distance matrices
+################################################################################
+
+setwd("~/Rabies/shortest_way_optimization/results")
+
+#original results
+wd0 <- rbind(read.csv('ASA_SWD1_2021.08.05.csv'),
+            read.csv('ASA_SWD2_2021.08.05.csv'),
+            read.csv('ASA_SWD3_2021.08.05.csv'),
+            read.csv('ASA_SWD4_2021.08.05.csv'),
+            read.csv('ASA_SWD5_2021.08.05.csv'),
+            read.csv('ASA_SWD6_2021.08.05.csv'),
+            read.csv('ASA_SWD7_2021.08.05.csv'),
+            read.csv('ASA_SWD8_2021.08.05.csv'),
+            read.csv('ASA_SWD9_2021.08.05.csv'))%>%
+  select(UNICODE_house, VaccPoint, PointName, distancia) %>%
+  rename(UNICODE = UNICODE_house)
+
+#new results calculated by Gian Sept 2021
+wd1 <- rbind(read.csv('result_Puntos_VANCAN_General_NeedWalkingDistance_1.csv'),
+             read.csv('result_Puntos_VANCAN_General_NeedWalkingDistance_2.csv'),
+             read.csv('result_Puntos_VANCAN_General_NeedWalkingDistance_3.csv'),
+             read.csv('result_Puntos_VANCAN_General_NeedWalkingDistance_4.csv'),
+             read.csv('result_Puntos_VANCAN_General_CURRENT_point3.csv'),
+             read.csv('result_Puntos_VANCAN_General_CURRENT_point2_1.csv'),
+             read.csv('result_Puntos_VANCAN_General_CURRENT_point2_2.csv'))
+
+#bind walking distance results together         
+wd <- bind_rows(wd0, wd1)
+
+################################################################################
+#Format distance matrices
+################################################################################
+#2016 distance matrix
+dist.2016<-wd%>% #filter main walking distance matrix for vacc points and houses in 2016
+  filter(VaccPoint %in% vac_points_2016$VaccPoint)%>% #vacc points
+  filter(UNICODE %in% house_2016_data$UNICODE)%>%#house
+  select(VaccPoint, UNICODE, distancia)%>%
+  tidyr::pivot_wider(names_from =VaccPoint, values_from = distancia)%>%
+  tibble::column_to_rownames('UNICODE')
+
+#2017 distance matrix
+dist.2017<-wd%>% #filter main walking distance matrix for vacc points and houses in 2016
+  filter(VaccPoint %in% vac_points_2017$VaccPoint)%>% #vacc points
+  filter(UNICODE %in% house_2017_data$UNICODE)%>%#house
+  select(VaccPoint, UNICODE, distancia)%>%
+  tidyr::pivot_wider(names_from =VaccPoint, values_from = distancia)%>%
+  tibble::column_to_rownames('UNICODE')
+
+#2018 distance matrix
+dist.2018<-wd%>% #filter main walking distance matrix for vacc points and houses in 2016
+  filter(VaccPoint %in% vac_points_2018$VaccPoint)%>% #vacc points
+  filter(UNICODE %in% house_2018_data$UNICODE)%>%#house
+  select(VaccPoint, UNICODE, distancia)%>%
+  tidyr::pivot_wider(names_from =VaccPoint, values_from = distancia)%>%
+  tibble::column_to_rownames('UNICODE')
+
+#2019 distance matrix
+dist.2019<-wd%>% #filter main walking distance matrix for vacc points and houses in 2016
+  filter(VaccPoint %in% vac_points_2019$VaccPoint)%>% #vacc points
+  filter(UNICODE %in% house_2019_data$UNICODE)%>%#house
+  select(VaccPoint, UNICODE, distancia)%>%
+  tidyr::pivot_wider(names_from =VaccPoint, values_from = distancia)%>%
+  tibble::column_to_rownames('UNICODE')
+
+
+#Function to find closest vaccination point for every house
+ClosestVaccFunction <- function(distance.matrix, min.matrix){
+  for(i in 1:nrow(distance.matrix)){
+    houseID <- rownames(distance.matrix)
+    vacID <- colnames(distance.matrix)
+    
+    #Find minimum distance
+    house <- distance.matrix[i,]
+    min.dist <- min(house)
+  
+    #Index house and vacc point for min distance
+    houseIndex <- houseID[i]
+    vacIndex <- which(house == min.dist)[[1]]
+    vacIndex <- vacID[vacIndex]
+    
+    #save to matrix
+    min.matrix <- rbind(min.matrix, c(houseIndex, vacIndex, min.dist))
+  }
+  min.matrix <- as.data.frame(min.matrix)
+  colnames(min.matrix) <- c("UNICODE", "Vacc_ID", "distance")
+  return(min.matrix)
+}
+
+#Find closest vaccination point based on minimum distance in distance matrix
+
+#2016
+newmins <-NULL
+newmins <- ClosestVaccFunction(dist.2016, newmins)
+house_2016_data <-full_join(house_2016_data, newmins)%>%
+  rename(lat = LATITUDE,
+         long =LONGITUDE,
+         vac_status = VIVIENDA_VANCAN_2016) %>%
+  mutate(year=2016)
+
+#2017
+newmins <-NULL
+newmins <- ClosestVaccFunction(dist.2017, newmins)
+house_2017_data <-full_join(house_2017_data, newmins)%>%
+  rename(lat = LATITUDE,
+         long =LONGITUDE,
+         vac_status = VIVIENDA_VANCAN_2017) %>%
+  mutate(year=2017)
+
+#2018
+newmins <-NULL
+newmins <- ClosestVaccFunction(dist.2018, newmins)
+house_2018_data <-full_join(house_2018_data, newmins)%>%
+  rename(lat = LATITUDE,
+         long =LONGITUDE,
+         vac_status = VIVIENDA_VANCAN_2018) %>%
+  mutate(year=2018)
+
+#2019
+newmins <-NULL
+newmins <- ClosestVaccFunction(dist.2019, newmins)
+house_2019_data <-full_join(house_2019_data, newmins)%>%
+  rename(lat = LATITUDE,
+         long =LONGITUDE,
+         vac_status = VIVIENDA_VANCAN_2019) %>%
+  mutate(year=2019)
+
+#bind together into one dataframe
+vac_data <- bind_rows(house_2016_data, 
+                      house_2017_data, 
+                      house_2018_data, 
+                      house_2019_data, 
+                      )
+vac_data$distance <- as.numeric(vac_data$distance)
+```
+
+### Participation probability regression
+
+# Regressions
+Create bins of data for count regressions
+```{r}
+vac_data <- vac_data%>%
+  mutate(Bin = NA)
+
+#Create bins
+BinWidth = 150 #THIS IS THE SIZE OF THE BINS
+MaxSeq <- ceiling(max(vac_data$distance)/BinWidth) #autoset to cover all distances
+bins <- data.frame(BinNum = seq(1:MaxSeq),
+                   StartDist= BinWidth*(seq(1:MaxSeq) -1),
+                   EndDist = BinWidth*seq(1:MaxSeq)) #ref table
+
+
+#Assign a bin number based on ref table
+for(i in 1:nrow(bins)){
+  row = bins[i,]
+  
+  #training data
+  vac_data <- vac_data %>%
+    mutate(Bin = ifelse(
+      distance >= row$StartDist[[1]] & distance < row$EndDist[[1]],row$BinNum[[1]], Bin))
+}
+
+
+#bin the training set
+vac_data.bin <- data.frame(plyr::count(vac_data%>%select(vac_status, Bin, year)))%>%
+  rename(BinNum = Bin)%>%
+  tidyr::pivot_wider(names_from=vac_status, values_from=freq)%>%
+  rename(num_not_vac = '0',
+         num_vac ='1')%>%
+  mutate(num_vac = tidyr::replace_na(num_vac, 0),
+         num_not_vac = tidyr::replace_na(num_not_vac, 0),
+         num_of_houses = num_not_vac+num_vac,
+         VaccFreq = num_vac/num_of_houses)
+
+vac_data.bin <- left_join(vac_data.bin, bins) %>% #add distance refs
+  mutate(mean_dist=(StartDist + EndDist)/2)
+
+vac_data_pois <- vac_data.bin
+```
+
+Run regressions
+```{r}
+#poisson
+poisreg<-glm(num_vac~mean_dist+offset(log(num_of_houses)),
+             family=poisson, data=vac_data_pois)
+#gaussian
+gaussreg<-glm(num_vac~mean_dist+offset(log(num_of_houses)),
+             family=gaussian, data=vac_data_pois)
+
+#negative binomial
+neg_binom<-MASS::glm.nb(num_vac~mean_dist+offset(log(num_of_houses)), data=vac_data_pois)
+
+#binomial
+model_binom<-glm(formula = vac_status ~ distance, family = "binomial", 
+               data = vac_data)
+
+```
+
+View table of results
+```{r}
+table <- data.frame(
+  model = c("poisson", "gaussian", "negative binomial", "binomial"),
+  formula = c(paste0(summary(poisreg)$call[2]), paste0(summary(gaussreg)$call[2]), 
+              paste0(summary(neg_binom)$call[2]), paste0(summary(model_binom)$call[2])),
+  intercept_beta = c(summary(poisreg)$coefficients[[1,1]], summary(gaussreg)$coefficients[[1,1]], 
+                summary(neg_binom)$coefficients[[1,1]], summary(model_binom)$coefficients[[1,1]]),
+  intercept_pval = c(summary(poisreg)$coefficients[[1,4]], summary(gaussreg)$coefficients[[1,4]], 
+                summary(neg_binom)$coefficients[[1,4]], summary(model_binom)$coefficients[[1,4]]),
+  distance_beta = c(summary(poisreg)$coefficients[[2,1]], summary(gaussreg)$coefficients[[2,1]], 
+                summary(neg_binom)$coefficients[[2,1]], summary(model_binom)$coefficients[[2,1]]),
+  distance_pval = c(summary(poisreg)$coefficients[[2,4]], summary(gaussreg)$coefficients[[2,4]], 
+                summary(neg_binom)$coefficients[[2,4]], summary(model_binom)$coefficients[[2,4]]),
+  AIC = c(summary(poisreg)$aic, summary(gaussreg)$aic, summary(neg_binom)$aic, summary(model_binom)$aic)
+  )
+
+table
+```
+
+Figure 2
+```{r}
+#check
+ggplot()+
+  theme_classic()+
+  geom_point(data=vac_data.bin, aes(x=mean_dist, y=VaccFreq, size=num_of_houses, color=as.factor(year)))+
+  ggtitle("Binned data")+
+  xlab("Bin mid distance") + ylab("Vaccinated Frequency")
+```
+
+
+## Tbart Optimization
